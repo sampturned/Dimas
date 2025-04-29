@@ -30,12 +30,12 @@ dos2unix "$APP_DIR/setup_stars_bot.sh"
 runuser -l "$VPS_USER" -c "python3 -m venv '$VENV_DIR'"
 runuser -l "$VPS_USER" -c "source '$VENV_DIR/bin/activate' && pip install --upgrade pip"
 if [[ -f "$APP_DIR/requirements.txt" ]]; then
-  runuser -l "$VPS_USER" -c "source '$VENV_DIR/bin/activate' && pip install -r '$APP_DIR/requirements.txt'"
+  runuser -l "$VPS_USER" -c "source '$VENV_DIR/bin/activate' && $VENV_DIR/bin/python3 -m pip install -r '$APP_DIR/requirements.txt'"
 else
-  runuser -l "$VPS_USER" -c "source '$VENV_DIR/bin/activate' && pip install playwright aiohttp playwright-stealth colorama"
+  runuser -l "$VPS_USER" -c "source '$VENV_DIR/bin/activate' && $VENV_DIR/bin/python3 -m pip install playwright aiohttp playwright-stealth colorama"
 fi
 # Установка браузерных движков для Playwright
-runuser -l "$VPS_USER" -c "source '$VENV_DIR/bin/activate' && playwright install"
+runuser -l "$VPS_USER" -c "source '$VENV_DIR/bin/activate' && $VENV_DIR/bin/python3 -m playwright install"
 
 # 4. Создание systemd-сервиса
 cat > "$SERVICE_FILE" <<EOF
@@ -57,11 +57,11 @@ WantedBy=multi-user.target
 EOF
 chmod 644 "$SERVICE_FILE"
 
-# 5. Настройка автозапуска (служба не запускается сразу)
+# 5. Автозапуск службы (без немедленного старта)
 systemctl daemon-reload
 systemctl enable stars_bot.service
 
 echo -e "\nСервис настроен на автозапуск после перезагрузки, но не запущен автоматически."
 echo "Запустите вручную: sudo systemctl start stars_bot.service"
 echo "Проверьте статус: sudo systemctl status stars_bot.service"
-echo "Чтобы очистить CRLF для других файлов: dos2unix <имя_файла>"
+echo "После изменения настроек (cookies.json, fragment_cookies.txt, seed.txt, settings.json) перезапустите: sudo systemctl restart stars_bot.service"
