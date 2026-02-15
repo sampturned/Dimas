@@ -932,6 +932,20 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
     if not form:
         return None
     data = {}
+
+    def put_value(name, value, multi=False):
+        if not name:
+            return
+        if not multi:
+            data[name] = value
+            return
+        if name not in data:
+            data[name] = [value]
+            return
+        if isinstance(data[name], list):
+            data[name].append(value)
+        else:
+            data[name] = [data[name], value]
     z99 = form.find("input", {"name": "____z99"})
     if z99:
         data["____z99"] = z99.get("value")
@@ -945,7 +959,7 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
         v = h.get("value")
         if v is None:
             continue
-        data[n] = v
+        put_value(n, v)
 
     tnorm = [normalize_text(t) for t in teacher_texts]
     numeric_texts = [t.strip() for t in teacher_texts if _looks_numeric(t)]
@@ -980,7 +994,7 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
         if not best and group:
             best = group[0].get("value")
         if best:
-            data[n] = best
+            put_value(n, best)
 
     # checkboxes (multiple choice)
     checkbox_groups = {}
@@ -1003,15 +1017,15 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
         if chosen:
             for idx, cb in enumerate(group):
                 if idx in chosen:
-                    data[cb.get("name")] = cb.get("value") or "on"
+                    put_value(cb.get("name"), cb.get("value") or "on", multi=True)
         else:
             for cb in group:
                 label = form.find("label", {"for": cb.get("id")})
                 ltxt = normalize_text(label.get_text(" ", strip=True)) if label else ""
                 if tnorm and ltxt in tnorm:
-                    data[cb.get("name")] = cb.get("value") or "on"
+                    put_value(cb.get("name"), cb.get("value") or "on", multi=True)
             if not tnorm and group:
-                data[group[0].get("name")] = group[0].get("value") or "on"
+                put_value(group[0].get("name"), group[0].get("value") or "on", multi=True)
 
     # selects
     for sel in form.find_all("select"):
@@ -1028,7 +1042,7 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
         if not picked and opts:
             picked = opts[0].get("value")
         if picked:
-            data[n] = picked
+            put_value(n, picked)
 
     # text inputs (plain) — заполняем по порядку ответами учителя
     text_inputs = form.find_all("input", {"type": "text"})
@@ -1038,12 +1052,12 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
             if not n:
                 continue
             if n in named_vals:
-                data[n] = named_vals[n]
+                put_value(n, named_vals[n])
             else:
                 # Prefer numeric answers for numeric-looking tasks.
                 src = numeric_texts or teacher_texts
                 ans = src[idx % len(src)].strip()
-                data[n] = ans
+                put_value(n, ans)
 
     # formula boxes data-name
     formula_inputs = [mi for mi in student_soup.find_all(attrs={"data-name": True}) if mi.get("data-name")]
@@ -1052,12 +1066,12 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
         if n in data:
             continue
         if n in named_vals:
-            data[n] = named_vals[n]
+            put_value(n, named_vals[n])
         elif teacher_texts:
             src = numeric_texts or teacher_texts
-            data[n] = src[idx % len(src)]
+            put_value(n, src[idx % len(src)])
         else:
-            data[n] = "1"
+            put_value(n, "1")
 
     # dnd: map from teacher correct ids if available
     dnd_inputs = []
@@ -1069,9 +1083,9 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
     teacher_dnd = student_soup._teacher_dnd_ids if hasattr(student_soup, "_teacher_dnd_ids") else []
     for idx, dnd in enumerate(dnd_inputs):
         if teacher_dnd and idx < len(teacher_dnd):
-            data[dnd.get("name")] = teacher_dnd[idx]
+            put_value(dnd.get("name"), teacher_dnd[idx])
         elif dnd_vals:
-            data[dnd.get("name")] = dnd_vals[-1]
+            put_value(dnd.get("name"), dnd_vals[-1])
 
     if not data:
         return None
