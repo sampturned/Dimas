@@ -920,9 +920,10 @@ def extract_dropdown_correct_values(teacher_soup):
     """Collect correct values for dropdown blocks in teacher result order."""
     values = []
     for span in teacher_soup.select(".gxs-result.gxs-result-dropdown .correct-answer"):
+        # Keep empty entries too: some punctuation tasks have a valid "no symbol" answer,
+        # and skipping blanks breaks per-dropdown positional mapping.
         txt = span.get_text(" ", strip=True)
-        if txt:
-            values.append(txt)
+        values.append(txt)
     return values
 
 
@@ -1060,12 +1061,22 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
 
         # Prefer per-select dropdown answers from teacher page for mixed text+dropdown tasks.
         if sidx < len(teacher_dropdown_values):
-            target = normalize_text(teacher_dropdown_values[sidx])
-            for o in opts:
-                txt = normalize_text(o.get_text(" ", strip=True))
-                if target and txt == target:
-                    picked = o.get("value")
-                    break
+            raw_target = teacher_dropdown_values[sidx]
+            target = normalize_text(raw_target)
+            if target:
+                for o in opts:
+                    txt = normalize_text(o.get_text(" ", strip=True))
+                    if txt == target:
+                        picked = o.get("value")
+                        break
+            else:
+                # Explicitly handle "empty symbol" answers (no comma/dash, etc.).
+                for o in opts:
+                    o_txt = (o.get_text(" ", strip=True) or "").strip()
+                    o_val = (o.get("value") or "").strip()
+                    if not o_txt or not o_val:
+                        picked = o.get("value")
+                        break
 
         if not picked:
             for o in opts:
