@@ -2126,6 +2126,13 @@ def monitor_job_loop(job_id):
                         job_log(job_id, "[solve] Пропуск: нет user_id (вероятно, попытка завершена или ученик не начинал).")
                         continue
                     tw_id = str(result.get("tw_id") or "")
+                    # Stable per-work key for anti-spam notifications in solve mode.
+                    # Prefer twId when present; otherwise fall back to (title + user).
+                    solve_track_key = (
+                        f"tw:{tw_id}"
+                        if tw_id
+                        else f"wu:{str(result.get('work_title') or work.get('title') or '').strip().lower()}|{result.get('user_id')}"
+                    )
                     if tw_id:
                         with jobs_lock:
                             j = active_jobs.get(str(job_id))
@@ -2144,17 +2151,33 @@ def monitor_job_loop(job_id):
                             continue
                     work_key = result.get("work_key") or f"{work.get('title')}_{result.get('user_id')}_{result.get('test_result_id')}"
                     start_thread = False
+                    notify_once = True
                     with active_solve_lock:
                         if work_key not in active_solve_threads:
                             active_solve_threads[work_key] = True
                             start_thread = True
+                    # Mark and check per-work notify flag under jobs_lock.
+                    with jobs_lock:
+                        j = active_jobs.get(str(job_id))
+                        if j is not None:
+                            ws = j.get("work_state") or {}
+                            entry = ws.get(solve_track_key) or {}
+                            notify_once = not bool(entry.get("notify_sent"))
+                            if notify_once:
+                                entry["notify_sent"] = True
+                                entry["ts"] = time.time()
+                                if not entry.get("status"):
+                                    entry["status"] = "seen"
+                                ws[solve_track_key] = entry
+                                j["work_state"] = ws
                     if start_thread:
                         job_log(job_id, f"Запуск решения {result.get('work_title', work.get('title',''))}")
-                        notify_job(
-                            job_id,
-                            f"Найдена работа для решения: {result.get('work_title', work.get('title',''))} "
-                            f"(статус {result.get('status','')}, {result.get('current_pct',0):.1f}%).",
-                        )
+                        if notify_once:
+                            notify_job(
+                                job_id,
+                                f"Найдена работа для решения: {result.get('work_title', work.get('title',''))} "
+                                f"(статус {result.get('status','')}, {result.get('current_pct',0):.1f}%).",
+                            )
                         threading.Thread(
                             target=worker_solve,
                             args=(job, work, result, work_key, job_id),
