@@ -355,19 +355,10 @@ def notify_all_chats(text):
 
 def notify_job(job_id, text, with_alert_icon=False):
     msg = f"⚠️ {text}" if with_alert_icon else text
-    # Prefer sending notifications only to the job owner chat (plus admin),
-    # to avoid failures/spam when approved_chat_ids contains inactive chats.
-    recipients = set()
+    # Broadcast job notifications to all approved chats.
+    recipients = set(str(x) for x in approved_chat_ids if str(x).strip())
     try:
         recipients.add(str(ADMIN_CHAT_ID))
-    except Exception:
-        pass
-    try:
-        with jobs_lock:
-            job = active_jobs.get(str(job_id))
-            cid = job.get("chat_id") if job else None
-        if cid:
-            recipients.add(str(cid))
     except Exception:
         pass
     if not recipients:
