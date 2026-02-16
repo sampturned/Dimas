@@ -906,6 +906,16 @@ def extract_select_correct_indices(teacher_soup):
     return blocks
 
 
+def extract_text_correct_values(teacher_soup):
+    """Collect correct answers for text-entry blocks in teacher result order."""
+    values = []
+    for span in teacher_soup.select(".gxs-result.gxs-result-text .correct-answer"):
+        txt = span.get_text(" ", strip=True)
+        if txt:
+            values.append(txt)
+    return values
+
+
 def extract_named_values(teacher_soup):
     """Map templated inputs (data-name) to their correct data-value from teacher page."""
     mapping = {}
@@ -964,6 +974,7 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
     tnorm = [normalize_text(t) for t in teacher_texts]
     numeric_texts = [t.strip() for t in teacher_texts if _looks_numeric(t)]
     named_vals = getattr(student_soup, "_teacher_named_values", {}) or {}
+    teacher_text_values = getattr(student_soup, "_teacher_text_values", []) or []
     # radios
     select_correct = getattr(student_soup, "_select_correct_indices", []) or []
     radio_groups = {}
@@ -1046,17 +1057,22 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
 
     # text inputs (plain) — заполняем по порядку ответами учителя
     text_inputs = form.find_all("input", {"type": "text"})
-    if text_inputs and teacher_texts:
+    if text_inputs:
         for idx, inp in enumerate(text_inputs):
             n = inp.get("name")
             if not n:
                 continue
             if n in named_vals:
                 put_value(n, named_vals[n])
-            else:
-                # Prefer numeric answers for numeric-looking tasks.
-                src = numeric_texts or teacher_texts
-                ans = src[idx % len(src)].strip()
+                continue
+
+            # For mixed tasks (select + text), use dedicated text-block answers first,
+            # otherwise global teacher_texts may contain select labels/explanations.
+            src = teacher_text_values or numeric_texts or teacher_texts
+            if not src:
+                continue
+            ans = str(src[idx % len(src)]).strip()
+            if ans:
                 put_value(n, ans)
 
     # formula boxes data-name
@@ -1103,12 +1119,14 @@ def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
         select_correct = extract_select_correct_indices(teacher_soup)
         named_vals = extract_named_values(teacher_soup)
         teacher_dnd = extract_dnd_mapping(teacher_soup)
+        text_values = extract_text_correct_values(teacher_soup)
 
         resp_stud = student_session.get(stud_url, headers=headers, impersonate="chrome120")
         student_soup = BeautifulSoup(resp_stud.text, "html.parser")
         student_soup._teacher_dnd_ids = teacher_dnd  # pass to payload builder
         student_soup._select_correct_indices = select_correct
         student_soup._teacher_named_values = named_vals
+        student_soup._teacher_text_values = text_values
         # Save remaining time if present
         try:
             timer_div = student_soup.find("div", class_="tst-time")
