@@ -1184,6 +1184,64 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
     return data
 
 
+def summarize_payload_choices(form, payload):
+    """Build short debug summary for selected radios/selects/checkboxes in payload."""
+    if not form or not isinstance(payload, dict):
+        return ""
+    chunks = []
+
+    # radios
+    radio_names = []
+    seen = set()
+    for r in form.find_all("input", {"type": "radio"}):
+        n = r.get("name")
+        if n and n not in seen:
+            seen.add(n)
+            radio_names.append(n)
+    for n in radio_names:
+        chosen = payload.get(n)
+        if chosen is None:
+            continue
+        label_txt = ""
+        for r in form.find_all("input", {"type": "radio", "name": n}):
+            if str(r.get("value")) == str(chosen):
+                lbl = form.find("label", {"for": r.get("id")})
+                label_txt = (lbl.get_text(" ", strip=True) if lbl else "")
+                break
+        chunks.append(f"radio[{n}]={chosen} ({label_txt})")
+
+    # selects
+    for sel in form.find_all("select"):
+        n = sel.get("name")
+        if not n or n not in payload:
+            continue
+        chosen = payload.get(n)
+        chosen_txt = ""
+        for o in sel.find_all("option"):
+            if str(o.get("value")) == str(chosen):
+                chosen_txt = o.get_text(" ", strip=True)
+                break
+        chunks.append(f"select[{n}]={chosen} ({chosen_txt})")
+
+    # checkboxes (count only to keep logs short)
+    cb_count = 0
+    for cb in form.find_all("input", {"type": "checkbox"}):
+        n = cb.get("name")
+        if not n:
+            continue
+        v = cb.get("value") or "on"
+        pv = payload.get(n)
+        if isinstance(pv, list):
+            if any(str(x) == str(v) for x in pv):
+                cb_count += 1
+        elif pv is not None and str(pv) == str(v):
+            cb_count += 1
+    if cb_count:
+        chunks.append(f"checkbox_selected={cb_count}")
+
+    return "; ".join(chunks)
+
+
 def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
     teacher_url = f"{BASE_URL}/TestWork/ExerciseResult?testResultId={test_result_id}&exercisePosition={ex_pos}&twId={tw_id}&sendContentLog=True"
     stud_url = f"{BASE_URL}/TestWorkRun/Exercise?testResultId={test_result_id}&exercisePosition={ex_pos}&twId={tw_id}"
@@ -1219,6 +1277,12 @@ def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
         payload = build_solution_payload(student_soup, correct_texts, work_key=work_key)
         if not payload:
             return False
+        try:
+            dbg = summarize_payload_choices(form, payload)
+            if dbg:
+                print(f"[Solve][ex {ex_pos}] {dbg}")
+        except Exception:
+            pass
         post_url = BASE_URL + form.get("action")
         resp_save = student_session.post(post_url, data=payload, headers=headers, impersonate="chrome120")
         return resp_save.status_code == 200
