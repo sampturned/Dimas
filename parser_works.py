@@ -355,19 +355,10 @@ def notify_all_chats(text):
 
 def notify_job(job_id, text, with_alert_icon=False):
     msg = f"⚠️ {text}" if with_alert_icon else text
-    # Prefer sending notifications only to the job owner chat (plus admin),
-    # to avoid failures/spam when approved_chat_ids contains inactive chats.
-    recipients = set()
+    # Broadcast job notifications to all approved chats.
+    recipients = set(str(x) for x in approved_chat_ids if str(x).strip())
     try:
         recipients.add(str(ADMIN_CHAT_ID))
-    except Exception:
-        pass
-    try:
-        with jobs_lock:
-            job = active_jobs.get(str(job_id))
-            cid = job.get("chat_id") if job else None
-        if cid:
-            recipients.add(str(cid))
     except Exception:
         pass
     if not recipients:
@@ -906,6 +897,44 @@ def extract_select_correct_indices(teacher_soup):
     return blocks
 
 
+def extract_text_correct_values(teacher_soup):
+    """Collect correct answers for text-entry blocks in teacher result order."""
+    values = []
+    for span in teacher_soup.select(".gxs-result.gxs-result-text .correct-answer"):
+        txt = span.get_text(" ", strip=True)
+        if txt:
+            values.append(txt)
+    return values
+
+
+def extract_dropdown_correct_values(teacher_soup):
+    """Collect correct values for dropdown blocks in teacher result order."""
+    values = []
+    for span in teacher_soup.select(".gxs-result.gxs-result-dropdown .correct-answer"):
+        # Keep empty entries too: some punctuation tasks have a valid "no symbol" answer,
+        # and skipping blanks breaks per-dropdown positional mapping.
+        txt = span.get_text(" ", strip=True)
+        values.append(txt)
+    return values
+
+
+def extract_select_correct_values(teacher_soup):
+    """Collect correct labels for select(single/multiple) blocks in teacher result order."""
+    values = []
+    for blk in teacher_soup.select(".gxs-result.gxs-result-select"):
+        ul = blk.select_one("ul.correct-answer")
+        if not ul:
+            continue
+        selected_text = ""
+        for li in ul.select("li"):
+            cls = " ".join(li.get("class", []))
+            if "checked" in cls or li.get("data-is-correct") == "true":
+                selected_text = li.get_text(" ", strip=True)
+                break
+        values.append(selected_text)
+    return values
+
+
 def extract_named_values(teacher_soup):
     """Map templated inputs (data-name) to their correct data-value from teacher page."""
     mapping = {}
@@ -932,6 +961,20 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
     if not form:
         return None
     data = {}
+
+    def put_value(name, value, multi=False):
+        if not name:
+            return
+        if not multi:
+            data[name] = value
+            return
+        if name not in data:
+            data[name] = [value]
+            return
+        if isinstance(data[name], list):
+            data[name].append(value)
+        else:
+            data[name] = [data[name], value]
     z99 = form.find("input", {"name": "____z99"})
     if z99:
         data["____z99"] = z99.get("value")
@@ -945,11 +988,30 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
         v = h.get("value")
         if v is None:
             continue
-        data[n] = v
+        put_value(n, v)
 
     tnorm = [normalize_text(t) for t in teacher_texts]
     numeric_texts = [t.strip() for t in teacher_texts if _looks_numeric(t)]
     named_vals = getattr(student_soup, "_teacher_named_values", {}) or {}
+    teacher_text_values = getattr(student_soup, "_teacher_text_values", []) or []
+    teacher_dropdown_values = getattr(student_soup, "_teacher_dropdown_values", []) or []
+    teacher_select_values = getattr(student_soup, "_teacher_select_values", []) or []
+
+    def _is_dropdown_like_select(opts):
+        if not opts:
+            return False
+        raw_texts = [(o.get_text(" ", strip=True) or "").strip() for o in opts]
+        non_empty = [t for t in raw_texts if t]
+        if not non_empty:
+            return True
+        punct = set(",.;:!?-—()[]{}«»\"'…")
+        for t in non_empty:
+            tt = t.replace(" ", "")
+            if len(tt) > 3:
+                return False
+            if any(ch not in punct for ch in tt):
+                return False
+        return True
     # radios
     select_correct = getattr(student_soup, "_select_correct_indices", []) or []
     radio_groups = {}
@@ -980,7 +1042,7 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
         if not best and group:
             best = group[0].get("value")
         if best:
-            data[n] = best
+            put_value(n, best)
 
     # checkboxes (multiple choice)
     checkbox_groups = {}
@@ -1003,47 +1065,90 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
         if chosen:
             for idx, cb in enumerate(group):
                 if idx in chosen:
-                    data[cb.get("name")] = cb.get("value") or "on"
+                    put_value(cb.get("name"), cb.get("value") or "on", multi=True)
         else:
             for cb in group:
                 label = form.find("label", {"for": cb.get("id")})
                 ltxt = normalize_text(label.get_text(" ", strip=True)) if label else ""
                 if tnorm and ltxt in tnorm:
-                    data[cb.get("name")] = cb.get("value") or "on"
+                    put_value(cb.get("name"), cb.get("value") or "on", multi=True)
             if not tnorm and group:
-                data[group[0].get("name")] = group[0].get("value") or "on"
+                put_value(group[0].get("name"), group[0].get("value") or "on", multi=True)
 
     # selects
-    for sel in form.find_all("select"):
+    select_inputs = form.find_all("select")
+    dropdown_idx = 0
+    select_idx = 0
+    for sidx, sel in enumerate(select_inputs):
         n = sel.get("name")
         if not n:
             continue
         opts = sel.find_all("option")
         picked = None
-        for o in opts:
-            txt = normalize_text(o.get_text(" ", strip=True))
-            if tnorm and txt in tnorm:
-                picked = o.get("value")
-                break
+        dropdown_like = _is_dropdown_like_select(opts)
+
+        # Prefer per-select dropdown answers from teacher page for mixed text+dropdown tasks.
+        if dropdown_like and dropdown_idx < len(teacher_dropdown_values):
+            raw_target = teacher_dropdown_values[dropdown_idx]
+            dropdown_idx += 1
+            target = normalize_text(raw_target)
+            if target:
+                for o in opts:
+                    txt = normalize_text(o.get_text(" ", strip=True))
+                    if txt == target:
+                        picked = o.get("value")
+                        break
+            else:
+                # Explicitly handle "empty symbol" answers (no comma/dash, etc.).
+                for o in opts:
+                    o_txt = (o.get_text(" ", strip=True) or "").strip()
+                    o_val = (o.get("value") or "").strip()
+                    if not o_txt or not o_val:
+                        picked = o.get("value")
+                        break
+
+        # For regular select tasks, prefer ordered teacher select labels.
+        if not picked and (not dropdown_like) and select_idx < len(teacher_select_values):
+            raw_target = teacher_select_values[select_idx]
+            select_idx += 1
+            target = normalize_text(raw_target)
+            if target:
+                for o in opts:
+                    txt = normalize_text(o.get_text(" ", strip=True))
+                    if txt == target:
+                        picked = o.get("value")
+                        break
+
+        if not picked:
+            for o in opts:
+                txt = normalize_text(o.get_text(" ", strip=True))
+                if tnorm and txt in tnorm:
+                    picked = o.get("value")
+                    break
         if not picked and opts:
             picked = opts[0].get("value")
         if picked:
-            data[n] = picked
+            put_value(n, picked)
 
     # text inputs (plain) — заполняем по порядку ответами учителя
     text_inputs = form.find_all("input", {"type": "text"})
-    if text_inputs and teacher_texts:
+    if text_inputs:
         for idx, inp in enumerate(text_inputs):
             n = inp.get("name")
             if not n:
                 continue
             if n in named_vals:
-                data[n] = named_vals[n]
-            else:
-                # Prefer numeric answers for numeric-looking tasks.
-                src = numeric_texts or teacher_texts
-                ans = src[idx % len(src)].strip()
-                data[n] = ans
+                put_value(n, named_vals[n])
+                continue
+
+            # For mixed tasks (select + text), use dedicated text-block answers first,
+            # otherwise global teacher_texts may contain select labels/explanations.
+            src = teacher_text_values or numeric_texts or teacher_texts
+            if not src:
+                continue
+            ans = str(src[idx % len(src)]).strip()
+            if ans:
+                put_value(n, ans)
 
     # formula boxes data-name
     formula_inputs = [mi for mi in student_soup.find_all(attrs={"data-name": True}) if mi.get("data-name")]
@@ -1052,12 +1157,12 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
         if n in data:
             continue
         if n in named_vals:
-            data[n] = named_vals[n]
+            put_value(n, named_vals[n])
         elif teacher_texts:
             src = numeric_texts or teacher_texts
-            data[n] = src[idx % len(src)]
+            put_value(n, src[idx % len(src)])
         else:
-            data[n] = "1"
+            put_value(n, "1")
 
     # dnd: map from teacher correct ids if available
     dnd_inputs = []
@@ -1069,14 +1174,72 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
     teacher_dnd = student_soup._teacher_dnd_ids if hasattr(student_soup, "_teacher_dnd_ids") else []
     for idx, dnd in enumerate(dnd_inputs):
         if teacher_dnd and idx < len(teacher_dnd):
-            data[dnd.get("name")] = teacher_dnd[idx]
+            put_value(dnd.get("name"), teacher_dnd[idx])
         elif dnd_vals:
-            data[dnd.get("name")] = dnd_vals[-1]
+            put_value(dnd.get("name"), dnd_vals[-1])
 
     if not data:
         return None
     data["answerAction"] = "correct"
     return data
+
+
+def summarize_payload_choices(form, payload):
+    """Build short debug summary for selected radios/selects/checkboxes in payload."""
+    if not form or not isinstance(payload, dict):
+        return ""
+    chunks = []
+
+    # radios
+    radio_names = []
+    seen = set()
+    for r in form.find_all("input", {"type": "radio"}):
+        n = r.get("name")
+        if n and n not in seen:
+            seen.add(n)
+            radio_names.append(n)
+    for n in radio_names:
+        chosen = payload.get(n)
+        if chosen is None:
+            continue
+        label_txt = ""
+        for r in form.find_all("input", {"type": "radio", "name": n}):
+            if str(r.get("value")) == str(chosen):
+                lbl = form.find("label", {"for": r.get("id")})
+                label_txt = (lbl.get_text(" ", strip=True) if lbl else "")
+                break
+        chunks.append(f"radio[{n}]={chosen} ({label_txt})")
+
+    # selects
+    for sel in form.find_all("select"):
+        n = sel.get("name")
+        if not n or n not in payload:
+            continue
+        chosen = payload.get(n)
+        chosen_txt = ""
+        for o in sel.find_all("option"):
+            if str(o.get("value")) == str(chosen):
+                chosen_txt = o.get_text(" ", strip=True)
+                break
+        chunks.append(f"select[{n}]={chosen} ({chosen_txt})")
+
+    # checkboxes (count only to keep logs short)
+    cb_count = 0
+    for cb in form.find_all("input", {"type": "checkbox"}):
+        n = cb.get("name")
+        if not n:
+            continue
+        v = cb.get("value") or "on"
+        pv = payload.get(n)
+        if isinstance(pv, list):
+            if any(str(x) == str(v) for x in pv):
+                cb_count += 1
+        elif pv is not None and str(pv) == str(v):
+            cb_count += 1
+    if cb_count:
+        chunks.append(f"checkbox_selected={cb_count}")
+
+    return "; ".join(chunks)
 
 
 def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
@@ -1089,12 +1252,18 @@ def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
         select_correct = extract_select_correct_indices(teacher_soup)
         named_vals = extract_named_values(teacher_soup)
         teacher_dnd = extract_dnd_mapping(teacher_soup)
+        text_values = extract_text_correct_values(teacher_soup)
+        dropdown_values = extract_dropdown_correct_values(teacher_soup)
+        select_values = extract_select_correct_values(teacher_soup)
 
         resp_stud = student_session.get(stud_url, headers=headers, impersonate="chrome120")
         student_soup = BeautifulSoup(resp_stud.text, "html.parser")
         student_soup._teacher_dnd_ids = teacher_dnd  # pass to payload builder
         student_soup._select_correct_indices = select_correct
         student_soup._teacher_named_values = named_vals
+        student_soup._teacher_text_values = text_values
+        student_soup._teacher_dropdown_values = dropdown_values
+        student_soup._teacher_select_values = select_values
         # Save remaining time if present
         try:
             timer_div = student_soup.find("div", class_="tst-time")
@@ -1108,6 +1277,12 @@ def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
         payload = build_solution_payload(student_soup, correct_texts, work_key=work_key)
         if not payload:
             return False
+        try:
+            dbg = summarize_payload_choices(form, payload)
+            if dbg:
+                print(f"[Solve][ex {ex_pos}] {dbg}")
+        except Exception:
+            pass
         post_url = BASE_URL + form.get("action")
         resp_save = student_session.post(post_url, data=payload, headers=headers, impersonate="chrome120")
         return resp_save.status_code == 200
@@ -1334,25 +1509,32 @@ def enter_student_work(student_session, work_title, work_key, target_percentage,
 
 
 # === ОРКЕСТРАТОР ===
+def force_set_student_password(user_id, new_password="1234"):
+    """Set student password from teacher account. Returns True on HTTP 200."""
+    change_pw_url = f"https://www.yaklass.ru/ManageSchool/ChangePassword/{user_id}"
+    try:
+        session.get(change_pw_url, headers=headers, impersonate="chrome120")
+        payload = {
+            "NewPassword": new_password,
+            "ConfirmPassword": new_password,
+            "Id": user_id,
+            "ReturnUrl": "/ManageSchool/Users",
+        }
+        resp_post = session.post(change_pw_url, data=payload, headers=headers, impersonate="chrome120")
+        return resp_post.status_code == 200
+    except Exception:
+        return False
+
+
 def change_user_password_and_login(user_id, user_name, work_title, work_key, target_percentage, tasks_to_spoil, test_result_id=None, tw_id=None):
     student_login = get_student_login(user_id)
     if not student_login:
         return
 
     print(f"   [Password] Смена пароля для {user_name}...")
-    change_pw_url = f"https://www.yaklass.ru/ManageSchool/ChangePassword/{user_id}"
 
     try:
-        session.get(change_pw_url, headers=headers, impersonate="chrome120")
-        payload = {
-            "NewPassword": "1234",
-            "ConfirmPassword": "1234",
-            "Id": user_id,
-            "ReturnUrl": "/ManageSchool/Users",
-        }
-        resp_post = session.post(change_pw_url, data=payload, headers=headers, impersonate="chrome120")
-
-        if resp_post.status_code == 200:
+        if force_set_student_password(user_id, "1234"):
             print("   [Password] Пароль изменен.")
             student_session = login_as_student(student_login, "1234")
             if student_session:
@@ -1484,9 +1666,14 @@ def worker_solve(job, work, result, work_key, job_id=None):
             return
         student_session = login_as_student(student_login, "1234")
         if not student_session:
-            job_log(jid, "[solve] Не удалось войти как ученик.")
-            set_work_state("login_failed")
-            return
+            # Fallback: reset password from teacher account and retry login once.
+            if user_id and force_set_student_password(user_id, "1234"):
+                job_log(jid, "[solve] Первый вход не удался. Сбросили пароль и повторяем вход...")
+                student_session = login_as_student(student_login, "1234")
+            if not student_session:
+                job_log(jid, "[solve] Не удалось войти как ученик.")
+                set_work_state("login_failed")
+                return
 
         # Если попытка ещё не запущена — стартуем её.
         if not test_result_id and tw_id:
@@ -2058,6 +2245,13 @@ def monitor_job_loop(job_id):
                         job_log(job_id, "[solve] Пропуск: нет user_id (вероятно, попытка завершена или ученик не начинал).")
                         continue
                     tw_id = str(result.get("tw_id") or "")
+                    # Stable per-work key for anti-spam notifications in solve mode.
+                    # Prefer twId when present; otherwise fall back to (title + user).
+                    solve_track_key = (
+                        f"tw:{tw_id}"
+                        if tw_id
+                        else f"wu:{str(result.get('work_title') or work.get('title') or '').strip().lower()}|{result.get('user_id')}"
+                    )
                     if tw_id:
                         with jobs_lock:
                             j = active_jobs.get(str(job_id))
@@ -2076,17 +2270,33 @@ def monitor_job_loop(job_id):
                             continue
                     work_key = result.get("work_key") or f"{work.get('title')}_{result.get('user_id')}_{result.get('test_result_id')}"
                     start_thread = False
+                    notify_once = True
                     with active_solve_lock:
                         if work_key not in active_solve_threads:
                             active_solve_threads[work_key] = True
                             start_thread = True
+                    # Mark and check per-work notify flag under jobs_lock.
+                    with jobs_lock:
+                        j = active_jobs.get(str(job_id))
+                        if j is not None:
+                            ws = j.get("work_state") or {}
+                            entry = ws.get(solve_track_key) or {}
+                            notify_once = not bool(entry.get("notify_sent"))
+                            if notify_once:
+                                entry["notify_sent"] = True
+                                entry["ts"] = time.time()
+                                if not entry.get("status"):
+                                    entry["status"] = "seen"
+                                ws[solve_track_key] = entry
+                                j["work_state"] = ws
                     if start_thread:
                         job_log(job_id, f"Запуск решения {result.get('work_title', work.get('title',''))}")
-                        notify_job(
-                            job_id,
-                            f"Найдена работа для решения: {result.get('work_title', work.get('title',''))} "
-                            f"(статус {result.get('status','')}, {result.get('current_pct',0):.1f}%).",
-                        )
+                        if notify_once:
+                            notify_job(
+                                job_id,
+                                f"Найдена работа для решения: {result.get('work_title', work.get('title',''))} "
+                                f"(статус {result.get('status','')}, {result.get('current_pct',0):.1f}%).",
+                            )
                         threading.Thread(
                             target=worker_solve,
                             args=(job, work, result, work_key, job_id),
@@ -3265,6 +3475,35 @@ def handle_callback_query(chat_id, message_id, data, callback_query_id=None):
         else:
             return
 
+        # Results flow: do not continue into task-creation student picker.
+        if state.get("mode") == "results":
+            work_title = state.get("work_title_filter") or "все работы"
+            work_link = ""
+            if state.get("works") and state.get("work_title_filter"):
+                for w in state.get("works") or []:
+                    if w.get("title") == state.get("work_title_filter"):
+                        work_link = w.get("link", "")
+                        break
+
+            if not work_link and state.get("works") and not state.get("work_title_filter"):
+                # "all works": show aggregate class snapshot.
+                students = collect_students_from_works(state.get("works") or [], max_works=10, time_budget_sec=20)
+                if not students:
+                    students = collect_students_for_class(state.get("class_name") or "", state.get("teacher_ids"))
+                lines = [f"<b>Результаты</b>", f"Класс: <b>{html.escape(state.get('class_name') or '')}</b>", ""]
+                for idx, (nm, p) in enumerate(students[:40], start=1):
+                    lines.append(f"{idx}. {html.escape(nm)} — <b>{p:.1f}%</b>")
+                send_tg_message(chat_id, "\n".join(lines))
+                return
+
+            tasks, results_rows = fetch_testwork_results_page(work_link)
+            class_label = html.escape(state.get("class_name") or "")
+            work_label = html.escape(work_title)
+            task_msg, students_msg = format_results_messages(tasks, results_rows, class_label, work_label)
+            send_tg_message(chat_id, task_msg)
+            send_tg_message(chat_id, students_msg)
+            return
+
         # Give immediate UI feedback: collecting students can take time due to multiple Yaklass requests.
         try:
             w_label = state.get("work_title_filter") or "все работы"
@@ -3333,32 +3572,6 @@ def handle_callback_query(chat_id, message_id, data, callback_query_id=None):
 
         threading.Thread(target=_bg_load_students, args=(chat_id, message_id, token), daemon=True).start()
         return
-        if state.get("mode") == "results":
-            # Show work results snapshot.
-            work_title = state.get("work_title_filter") or "все работы"
-            work_link = ""
-            if state.get("works") and state.get("work_title_filter"):
-                # try to find the selected work to get its link
-                for w in state.get("works") or []:
-                    if w.get("title") == state.get("work_title_filter"):
-                        work_link = w.get("link", "")
-                        break
-            if not work_link and state.get("works") and not state.get("work_title_filter"):
-                # "all works" doesn't map to a single results page; fall back to class aggregate list.
-                lines = [f"<b>Результаты</b>", f"Класс: <b>{html.escape(state.get('class_name') or '')}</b>", ""]
-                for idx, (nm, p) in enumerate(students[:40], start=1):
-                    lines.append(f"{idx}. {html.escape(nm)} — <b>{p:.1f}%</b>")
-                send_tg_message(chat_id, "\n".join(lines))
-                return
-
-            tasks, results_rows = fetch_testwork_results_page(work_link)
-            class_label = html.escape(state.get("class_name") or "")
-            work_label = html.escape(work_title)
-
-            task_msg, students_msg = format_results_messages(tasks, results_rows, class_label, work_label)
-            send_tg_message(chat_id, task_msg)
-            send_tg_message(chat_id, students_msg)
-            return
 
         state["students"] = students
         state["step"] = "pick_student_btn"
@@ -3369,6 +3582,9 @@ def handle_callback_query(chat_id, message_id, data, callback_query_id=None):
     # Students
     if data.startswith("stud:"):
         _ack()
+        if state.get("mode") == "results":
+            # In results flow student selection is not used for job creation.
+            return
         if data == "stud:back":
             state["step"] = "pick_work_btn"
             render_flow(chat_id, state)
