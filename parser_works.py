@@ -1402,25 +1402,32 @@ def enter_student_work(student_session, work_title, work_key, target_percentage,
 
 
 # === ОРКЕСТРАТОР ===
+def force_set_student_password(user_id, new_password="1234"):
+    """Set student password from teacher account. Returns True on HTTP 200."""
+    change_pw_url = f"https://www.yaklass.ru/ManageSchool/ChangePassword/{user_id}"
+    try:
+        session.get(change_pw_url, headers=headers, impersonate="chrome120")
+        payload = {
+            "NewPassword": new_password,
+            "ConfirmPassword": new_password,
+            "Id": user_id,
+            "ReturnUrl": "/ManageSchool/Users",
+        }
+        resp_post = session.post(change_pw_url, data=payload, headers=headers, impersonate="chrome120")
+        return resp_post.status_code == 200
+    except Exception:
+        return False
+
+
 def change_user_password_and_login(user_id, user_name, work_title, work_key, target_percentage, tasks_to_spoil, test_result_id=None, tw_id=None):
     student_login = get_student_login(user_id)
     if not student_login:
         return
 
     print(f"   [Password] Смена пароля для {user_name}...")
-    change_pw_url = f"https://www.yaklass.ru/ManageSchool/ChangePassword/{user_id}"
 
     try:
-        session.get(change_pw_url, headers=headers, impersonate="chrome120")
-        payload = {
-            "NewPassword": "1234",
-            "ConfirmPassword": "1234",
-            "Id": user_id,
-            "ReturnUrl": "/ManageSchool/Users",
-        }
-        resp_post = session.post(change_pw_url, data=payload, headers=headers, impersonate="chrome120")
-
-        if resp_post.status_code == 200:
+        if force_set_student_password(user_id, "1234"):
             print("   [Password] Пароль изменен.")
             student_session = login_as_student(student_login, "1234")
             if student_session:
@@ -1552,9 +1559,14 @@ def worker_solve(job, work, result, work_key, job_id=None):
             return
         student_session = login_as_student(student_login, "1234")
         if not student_session:
-            job_log(jid, "[solve] Не удалось войти как ученик.")
-            set_work_state("login_failed")
-            return
+            # Fallback: reset password from teacher account and retry login once.
+            if user_id and force_set_student_password(user_id, "1234"):
+                job_log(jid, "[solve] Первый вход не удался. Сбросили пароль и повторяем вход...")
+                student_session = login_as_student(student_login, "1234")
+            if not student_session:
+                job_log(jid, "[solve] Не удалось войти как ученик.")
+                set_work_state("login_failed")
+                return
 
         # Если попытка ещё не запущена — стартуем её.
         if not test_result_id and tw_id:
