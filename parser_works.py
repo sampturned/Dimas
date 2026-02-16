@@ -916,6 +916,16 @@ def extract_text_correct_values(teacher_soup):
     return values
 
 
+def extract_dropdown_correct_values(teacher_soup):
+    """Collect correct values for dropdown blocks in teacher result order."""
+    values = []
+    for span in teacher_soup.select(".gxs-result.gxs-result-dropdown .correct-answer"):
+        txt = span.get_text(" ", strip=True)
+        if txt:
+            values.append(txt)
+    return values
+
+
 def extract_named_values(teacher_soup):
     """Map templated inputs (data-name) to their correct data-value from teacher page."""
     mapping = {}
@@ -975,6 +985,7 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
     numeric_texts = [t.strip() for t in teacher_texts if _looks_numeric(t)]
     named_vals = getattr(student_soup, "_teacher_named_values", {}) or {}
     teacher_text_values = getattr(student_soup, "_teacher_text_values", []) or []
+    teacher_dropdown_values = getattr(student_soup, "_teacher_dropdown_values", []) or []
     # radios
     select_correct = getattr(student_soup, "_select_correct_indices", []) or []
     radio_groups = {}
@@ -1039,17 +1050,29 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
                 put_value(group[0].get("name"), group[0].get("value") or "on", multi=True)
 
     # selects
-    for sel in form.find_all("select"):
+    select_inputs = form.find_all("select")
+    for sidx, sel in enumerate(select_inputs):
         n = sel.get("name")
         if not n:
             continue
         opts = sel.find_all("option")
         picked = None
-        for o in opts:
-            txt = normalize_text(o.get_text(" ", strip=True))
-            if tnorm and txt in tnorm:
-                picked = o.get("value")
-                break
+
+        # Prefer per-select dropdown answers from teacher page for mixed text+dropdown tasks.
+        if sidx < len(teacher_dropdown_values):
+            target = normalize_text(teacher_dropdown_values[sidx])
+            for o in opts:
+                txt = normalize_text(o.get_text(" ", strip=True))
+                if target and txt == target:
+                    picked = o.get("value")
+                    break
+
+        if not picked:
+            for o in opts:
+                txt = normalize_text(o.get_text(" ", strip=True))
+                if tnorm and txt in tnorm:
+                    picked = o.get("value")
+                    break
         if not picked and opts:
             picked = opts[0].get("value")
         if picked:
@@ -1120,6 +1143,7 @@ def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
         named_vals = extract_named_values(teacher_soup)
         teacher_dnd = extract_dnd_mapping(teacher_soup)
         text_values = extract_text_correct_values(teacher_soup)
+        dropdown_values = extract_dropdown_correct_values(teacher_soup)
 
         resp_stud = student_session.get(stud_url, headers=headers, impersonate="chrome120")
         student_soup = BeautifulSoup(resp_stud.text, "html.parser")
@@ -1127,6 +1151,7 @@ def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
         student_soup._select_correct_indices = select_correct
         student_soup._teacher_named_values = named_vals
         student_soup._teacher_text_values = text_values
+        student_soup._teacher_dropdown_values = dropdown_values
         # Save remaining time if present
         try:
             timer_div = student_soup.find("div", class_="tst-time")
