@@ -918,6 +918,23 @@ def extract_dropdown_correct_values(teacher_soup):
     return values
 
 
+def extract_select_correct_values(teacher_soup):
+    """Collect correct labels for select(single/multiple) blocks in teacher result order."""
+    values = []
+    for blk in teacher_soup.select(".gxs-result.gxs-result-select"):
+        ul = blk.select_one("ul.correct-answer")
+        if not ul:
+            continue
+        selected_text = ""
+        for li in ul.select("li"):
+            cls = " ".join(li.get("class", []))
+            if "checked" in cls or li.get("data-is-correct") == "true":
+                selected_text = li.get_text(" ", strip=True)
+                break
+        values.append(selected_text)
+    return values
+
+
 def extract_named_values(teacher_soup):
     """Map templated inputs (data-name) to their correct data-value from teacher page."""
     mapping = {}
@@ -978,6 +995,23 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
     named_vals = getattr(student_soup, "_teacher_named_values", {}) or {}
     teacher_text_values = getattr(student_soup, "_teacher_text_values", []) or []
     teacher_dropdown_values = getattr(student_soup, "_teacher_dropdown_values", []) or []
+    teacher_select_values = getattr(student_soup, "_teacher_select_values", []) or []
+
+    def _is_dropdown_like_select(opts):
+        if not opts:
+            return False
+        raw_texts = [(o.get_text(" ", strip=True) or "").strip() for o in opts]
+        non_empty = [t for t in raw_texts if t]
+        if not non_empty:
+            return True
+        punct = set(",.;:!?-—()[]{}«»\"'…")
+        for t in non_empty:
+            tt = t.replace(" ", "")
+            if len(tt) > 3:
+                return False
+            if any(ch not in punct for ch in tt):
+                return False
+        return True
     # radios
     select_correct = getattr(student_soup, "_select_correct_indices", []) or []
     radio_groups = {}
@@ -1043,16 +1077,20 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
 
     # selects
     select_inputs = form.find_all("select")
+    dropdown_idx = 0
+    select_idx = 0
     for sidx, sel in enumerate(select_inputs):
         n = sel.get("name")
         if not n:
             continue
         opts = sel.find_all("option")
         picked = None
+        dropdown_like = _is_dropdown_like_select(opts)
 
         # Prefer per-select dropdown answers from teacher page for mixed text+dropdown tasks.
-        if sidx < len(teacher_dropdown_values):
-            raw_target = teacher_dropdown_values[sidx]
+        if dropdown_like and dropdown_idx < len(teacher_dropdown_values):
+            raw_target = teacher_dropdown_values[dropdown_idx]
+            dropdown_idx += 1
             target = normalize_text(raw_target)
             if target:
                 for o in opts:
@@ -1066,6 +1104,18 @@ def build_solution_payload(student_soup, teacher_texts, work_key=None):
                     o_txt = (o.get_text(" ", strip=True) or "").strip()
                     o_val = (o.get("value") or "").strip()
                     if not o_txt or not o_val:
+                        picked = o.get("value")
+                        break
+
+        # For regular select tasks, prefer ordered teacher select labels.
+        if not picked and (not dropdown_like) and select_idx < len(teacher_select_values):
+            raw_target = teacher_select_values[select_idx]
+            select_idx += 1
+            target = normalize_text(raw_target)
+            if target:
+                for o in opts:
+                    txt = normalize_text(o.get_text(" ", strip=True))
+                    if txt == target:
                         picked = o.get("value")
                         break
 
@@ -1146,6 +1196,7 @@ def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
         teacher_dnd = extract_dnd_mapping(teacher_soup)
         text_values = extract_text_correct_values(teacher_soup)
         dropdown_values = extract_dropdown_correct_values(teacher_soup)
+        select_values = extract_select_correct_values(teacher_soup)
 
         resp_stud = student_session.get(stud_url, headers=headers, impersonate="chrome120")
         student_soup = BeautifulSoup(resp_stud.text, "html.parser")
@@ -1154,6 +1205,7 @@ def solve_task(student_session, test_result_id, tw_id, ex_pos, work_key=None):
         student_soup._teacher_named_values = named_vals
         student_soup._teacher_text_values = text_values
         student_soup._teacher_dropdown_values = dropdown_values
+        student_soup._teacher_select_values = select_values
         # Save remaining time if present
         try:
             timer_div = student_soup.find("div", class_="tst-time")
