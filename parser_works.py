@@ -3356,6 +3356,35 @@ def handle_callback_query(chat_id, message_id, data, callback_query_id=None):
         else:
             return
 
+        # Results flow: do not continue into task-creation student picker.
+        if state.get("mode") == "results":
+            work_title = state.get("work_title_filter") or "все работы"
+            work_link = ""
+            if state.get("works") and state.get("work_title_filter"):
+                for w in state.get("works") or []:
+                    if w.get("title") == state.get("work_title_filter"):
+                        work_link = w.get("link", "")
+                        break
+
+            if not work_link and state.get("works") and not state.get("work_title_filter"):
+                # "all works": show aggregate class snapshot.
+                students = collect_students_from_works(state.get("works") or [], max_works=10, time_budget_sec=20)
+                if not students:
+                    students = collect_students_for_class(state.get("class_name") or "", state.get("teacher_ids"))
+                lines = [f"<b>Результаты</b>", f"Класс: <b>{html.escape(state.get('class_name') or '')}</b>", ""]
+                for idx, (nm, p) in enumerate(students[:40], start=1):
+                    lines.append(f"{idx}. {html.escape(nm)} — <b>{p:.1f}%</b>")
+                send_tg_message(chat_id, "\n".join(lines))
+                return
+
+            tasks, results_rows = fetch_testwork_results_page(work_link)
+            class_label = html.escape(state.get("class_name") or "")
+            work_label = html.escape(work_title)
+            task_msg, students_msg = format_results_messages(tasks, results_rows, class_label, work_label)
+            send_tg_message(chat_id, task_msg)
+            send_tg_message(chat_id, students_msg)
+            return
+
         # Give immediate UI feedback: collecting students can take time due to multiple Yaklass requests.
         try:
             w_label = state.get("work_title_filter") or "все работы"
@@ -3424,32 +3453,6 @@ def handle_callback_query(chat_id, message_id, data, callback_query_id=None):
 
         threading.Thread(target=_bg_load_students, args=(chat_id, message_id, token), daemon=True).start()
         return
-        if state.get("mode") == "results":
-            # Show work results snapshot.
-            work_title = state.get("work_title_filter") or "все работы"
-            work_link = ""
-            if state.get("works") and state.get("work_title_filter"):
-                # try to find the selected work to get its link
-                for w in state.get("works") or []:
-                    if w.get("title") == state.get("work_title_filter"):
-                        work_link = w.get("link", "")
-                        break
-            if not work_link and state.get("works") and not state.get("work_title_filter"):
-                # "all works" doesn't map to a single results page; fall back to class aggregate list.
-                lines = [f"<b>Результаты</b>", f"Класс: <b>{html.escape(state.get('class_name') or '')}</b>", ""]
-                for idx, (nm, p) in enumerate(students[:40], start=1):
-                    lines.append(f"{idx}. {html.escape(nm)} — <b>{p:.1f}%</b>")
-                send_tg_message(chat_id, "\n".join(lines))
-                return
-
-            tasks, results_rows = fetch_testwork_results_page(work_link)
-            class_label = html.escape(state.get("class_name") or "")
-            work_label = html.escape(work_title)
-
-            task_msg, students_msg = format_results_messages(tasks, results_rows, class_label, work_label)
-            send_tg_message(chat_id, task_msg)
-            send_tg_message(chat_id, students_msg)
-            return
 
         state["students"] = students
         state["step"] = "pick_student_btn"
@@ -3460,6 +3463,9 @@ def handle_callback_query(chat_id, message_id, data, callback_query_id=None):
     # Students
     if data.startswith("stud:"):
         _ack()
+        if state.get("mode") == "results":
+            # In results flow student selection is not used for job creation.
+            return
         if data == "stud:back":
             state["step"] = "pick_work_btn"
             render_flow(chat_id, state)
